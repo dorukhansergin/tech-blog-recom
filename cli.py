@@ -2,7 +2,7 @@ import click
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 from scrapers import SOURCE_SCRAPERS, SourceName
 from models import BlogEntry, ProcessedBlogEntry
 import os
@@ -44,15 +44,25 @@ def cli():
 
 @cli.command()
 @click.option(
-    "--source",
+    "--sources",
     "-s",
     type=click.Choice(list(SOURCE_SCRAPERS.keys())),
+    multiple=True,
     required=True,
-    help="Source name to scrape (e.g., 'GOOGLE_RESEARCH', 'ALL_THINGS_DISTRIBUTED')",
+    help="Source names to scrape (e.g., 'google_research', 'lyft_engineering'). Can specify multiple times.",
 )
-@click.option("--limit", "-l", type=int, help="Maximum number of posts to scrape")
-def scrape(source: str, limit: Optional[int]):
-    """Scrape blog posts from a single source."""
+@click.option(
+    "--limit", "-l", type=int, help="Maximum number of posts to scrape per source"
+)
+@click.option(
+    "--output",
+    "-o",
+    type=str,
+    default="combined",
+    help="Output filename prefix (without extension)",
+)
+def scrape(sources: List[str], limit: Optional[int], output: str):
+    """Scrape blog posts from multiple sources and combine them into a single file."""
 
     # Initialize models
     model = SentenceTransformer("all-MiniLM-L6-v2")
@@ -62,29 +72,31 @@ def scrape(source: str, limit: Optional[int]):
     output_dir = Path("data")
     output_dir.mkdir(exist_ok=True)
 
-    # Initialize scraper
-    scraper = SOURCE_SCRAPERS[source]()
+    all_entries = []
 
-    click.echo(f"\nProcessing source: {source}")
+    for source in sources:
+        click.echo(f"\nProcessing source: {source}")
 
-    # Collect entries
-    entries = []
-    for i, entry in enumerate(scraper.scrape()):
-        if limit and i >= limit:
-            break
+        # Initialize scraper
+        scraper = SOURCE_SCRAPERS[source]()
 
-        try:
-            processed_entry = process_entry(entry, model, keyword_model)
-            entries.append(processed_entry)
-            click.echo(f"Processed ({i + 1}): {entry.title}")
+        # Collect entries
+        for i, entry in enumerate(scraper.scrape()):
+            if limit and i >= limit:
+                break
 
-            # Add a small delay between requests
-            time.sleep(0.5)
+            try:
+                processed_entry = process_entry(entry, model, keyword_model)
+                all_entries.append(processed_entry)
+                click.echo(f"Processed ({i + 1}): {entry.title}")
 
-        except Exception as e:
-            click.echo(f"Error processing {entry.url}: {str(e)}")
+                # Add a small delay between requests
+                time.sleep(0.5)
 
-    if not entries:
+            except Exception as e:
+                click.echo(f"Error processing {entry.url}: {str(e)}")
+
+    if not all_entries:
         click.echo("No blog posts found.")
         return
 
@@ -100,16 +112,16 @@ def scrape(source: str, limit: Optional[int]):
                 "embedding": e.embedding,
                 "keywords": e.keywords,
             }
-            for e in entries
+            for e in all_entries
         ]
     )
 
     # Save to parquet
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"{source}_{timestamp}.parquet"
+    output_file = output_dir / f"{output}_{timestamp}.parquet"
     df.to_parquet(output_file)
 
-    click.echo(f"\nSaved {len(entries)} entries to {output_file}")
+    click.echo(f"\nSaved {len(all_entries)} entries to {output_file}")
 
 
 if __name__ == "__main__":
