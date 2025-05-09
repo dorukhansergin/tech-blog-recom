@@ -55,6 +55,18 @@ async def search(job_description: str = Form(...)):
 
     # Get top 5 matches
     top_indices = np.argsort(similarities)[-5:][::-1]
-    results = df.iloc[top_indices][["title", "url", "source"]].to_dict("records")
+    results = df.iloc[top_indices][["title", "url", "source", "content"]].to_dict(
+        "records"
+    )
+
+    # Add previews to results
+    for result in results:
+        # Get first 200 characters of content and add ellipsis
+        preview = result["content"][:200].strip() + "..."
+        result["preview"] = preview
+        # Rename source to source_name to match frontend
+        result["source_name"] = result.pop("source")
+        # Remove the full content to keep response size small
+        del result["content"]
 
     return {"results": results}
