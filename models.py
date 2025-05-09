@@ -1,6 +1,9 @@
 from sqlalchemy import Column, Integer, String, Text, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from datetime import datetime
+from dataclasses import dataclass
+from typing import List, Optional
+import numpy as np
 
 Base = declarative_base()
 
@@ -20,3 +23,22 @@ class BlogPost(Base):
 
     def __repr__(self):
         return f"<BlogPost(title='{self.title}', source_name='{self.source_name}')>"
+
+
+@dataclass
+class BlogEntry:
+    """Raw blog entry before processing."""
+
+    title: str
+    url: str
+    source: str
+    published_at: datetime
+    content: str
+
+
+@dataclass
+class ProcessedBlogEntry(BlogEntry):
+    """Blog entry after processing with embeddings and keywords."""
+
+    embedding: np.ndarray
+    keywords: List[str]
