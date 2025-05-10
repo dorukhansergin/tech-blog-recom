@@ -1,8 +1,12 @@
 from datetime import datetime
-from typing import Iterator, Optional
+from typing import Iterator, Optional, Set
 import logging
 import feedparser
 import re
+import requests
+import json
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse, parse_qs
 
 from .base import BaseSourceScraper
 from models import BlogEntry
@@ -13,12 +17,31 @@ logger = logging.getLogger(__name__)
 class MetaEngineeringScraper(BaseSourceScraper):
     """Scraper for Meta (Facebook) Engineering blog."""
 
-    feed_url = "https://code.facebook.com/posts/rss/"
+    rss_feed_url = "https://code.facebook.com/posts/rss/"
+    blog_url = "https://engineering.fb.com/"
+    graphql_url = "https://engineering.fb.com/wp-json/wp/v2/posts"
+    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+
+    def __init__(self):
+        """Initialize the scraper with a configured requests session."""
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "User-Agent": self.user_agent,
+                "Accept": "application/json",
+                "Accept-Language": "en-US,en;q=0.5",
+            }
+        )
+        self.processed_urls = set()
 
     def _clean_content(self, content: str) -> str:
         """Clean and normalize content."""
         if not content:
             return ""
+
+        # Remove HTML tags
+        if bool(BeautifulSoup(content, "html.parser").find()):
+            content = BeautifulSoup(content, "html.parser").get_text()
 
         # Remove extra whitespace
         content = " ".join(content.split())
@@ -52,40 +75,40 @@ class MetaEngineeringScraper(BaseSourceScraper):
 
         return True
 
-    def _extract_date(self, entry) -> datetime:
-        """Extract and validate publish date from entry.
-
-        Tries multiple date fields and falls back to current time if none are valid.
-        """
-        # Try published_parsed first (struct_time)
-        if hasattr(entry, "published_parsed") and entry.published_parsed:
-            return datetime(*entry.published_parsed[:6])
-
-        # Try published (string)
-        if hasattr(entry, "published"):
+    def _extract_date(self, date_str: Optional[str] = None) -> datetime:
+        """Extract and validate publish date from string or return current time."""
+        if date_str:
             try:
-                # Try parsing the string directly
-                return datetime.strptime(entry.published, "%a, %d %b %Y %H:%M:%S %z")
-            except ValueError:
-                logger.warning(f"Could not parse published date: {entry.published}")
+                # Try common date formats
+                formats = [
+                    "%a, %d %b %Y %H:%M:%S %z",  # RSS feed format
+                    "%Y-%m-%dT%H:%M:%S",  # ISO format
+                    "%Y-%m-%d %H:%M:%S",  # Common format
+                    "%B %d, %Y",  # Blog format
+                    "%Y-%m-%d",  # Short ISO format
+                ]
 
-        # Try updated fields as fallback
-        if hasattr(entry, "updated_parsed") and entry.updated_parsed:
-            return datetime(*entry.updated_parsed[:6])
+                for fmt in formats:
+                    try:
+                        return datetime.strptime(date_str, fmt)
+                    except ValueError:
+                        continue
 
-        if hasattr(entry, "updated"):
-            try:
-                return datetime.strptime(entry.updated, "%a, %d %b %Y %H:%M:%S %z")
-            except ValueError:
-                logger.warning(f"Could not parse updated date: {entry.updated}")
+                logger.warning(f"Could not parse date: {date_str}")
+            except Exception as e:
+                logger.warning(f"Error parsing date: {str(e)}")
 
         # Last resort: use current time
         logger.warning("No valid date found, using current time")
         return datetime.utcnow()
 
-    def _process_entry(self, entry) -> Optional[BlogEntry]:
+    def _process_rss_entry(self, entry) -> Optional[BlogEntry]:
         """Process a single RSS entry into a BlogEntry."""
         try:
+            # Skip if we've already processed this URL
+            if entry.link in self.processed_urls:
+                return None
+
             # Validate required fields
             if not all(hasattr(entry, attr) for attr in ["title", "link"]):
                 logger.warning(
@@ -106,11 +129,21 @@ class MetaEngineeringScraper(BaseSourceScraper):
                 logger.warning(f"Invalid content for entry: {entry.link}")
                 return None
 
+            # Extract date
+            published_at = None
+            if hasattr(entry, "published"):
+                published_at = self._extract_date(entry.published)
+            elif hasattr(entry, "updated"):
+                published_at = self._extract_date(entry.updated)
+            else:
+                published_at = datetime.utcnow()
+
+            self.processed_urls.add(entry.link)
             return BlogEntry(
                 url=entry.link,
                 title=entry.title,
                 content=content,
-                published_at=self._extract_date(entry),
+                published_at=published_at,
                 source="Meta Engineering",
             )
 
@@ -118,26 +151,86 @@ class MetaEngineeringScraper(BaseSourceScraper):
             logger.error(f"Error processing entry: {str(e)}")
             return None
 
-    def scrape(self) -> Iterator[BlogEntry]:
-        """Scrape Meta Engineering blog posts from RSS feed."""
+    def _fetch_graphql_posts(
+        self, page: int = 1, per_page: int = 20
+    ) -> Iterator[BlogEntry]:
+        """Fetch blog posts using the WordPress GraphQL API."""
         try:
-            logger.info(f"Fetching feed from {self.feed_url}")
-            feed = feedparser.parse(self.feed_url)
+            params = {
+                "page": page,
+                "per_page": per_page,
+                "_embed": 1,  # Include embedded content
+            }
 
-            if not self._validate_feed(feed):
-                raise ValueError("Invalid feed structure")
+            response = self.session.get(self.graphql_url, params=params, timeout=30)
+            response.raise_for_status()
 
-            entry_count = 0
-            for entry in feed.entries:
-                blog_entry = self._process_entry(entry)
-                if blog_entry:
-                    entry_count += 1
-                    yield blog_entry
+            posts = response.json()
+            if not posts:
+                return
 
-            logger.info(f"Successfully processed {entry_count} entries from feed")
+            for post in posts:
+                try:
+                    url = post.get("link")
+                    if not url or url in self.processed_urls:
+                        continue
+
+                    # Extract content
+                    content = post.get("content", {}).get("rendered", "")
+                    if not content:
+                        content = post.get("excerpt", {}).get("rendered", "")
+
+                    content = self._clean_content(content)
+
+                    # Extract date
+                    date_str = post.get("date")
+                    published_at = (
+                        self._extract_date(date_str) if date_str else datetime.utcnow()
+                    )
+
+                    # Create blog entry
+                    self.processed_urls.add(url)
+                    yield BlogEntry(
+                        url=url,
+                        title=self._clean_content(
+                            post.get("title", {}).get("rendered", "")
+                        ),
+                        content=content,
+                        published_at=published_at,
+                        source="Meta Engineering",
+                    )
+
+                except Exception as e:
+                    logger.error(f"Error processing GraphQL post: {str(e)}")
+                    continue
+
+            # Check if there are more pages
+            total_pages = int(response.headers.get("X-WP-TotalPages", 1))
+            if page < total_pages and page < 5:  # Limit to 5 pages (100 posts)
+                yield from self._fetch_graphql_posts(page + 1, per_page)
 
         except Exception as e:
-            logger.error(f"Failed to parse Meta Engineering RSS feed: {str(e)}")
+            logger.error(f"Error fetching GraphQL posts: {str(e)}")
+
+    def scrape(self) -> Iterator[BlogEntry]:
+        """Scrape Meta Engineering blog posts from both RSS feed and GraphQL API."""
+        try:
+            # First try RSS feed
+            logger.info(f"Fetching feed from {self.rss_feed_url}")
+            feed = feedparser.parse(self.rss_feed_url)
+
+            if self._validate_feed(feed):
+                for entry in feed.entries:
+                    blog_entry = self._process_rss_entry(entry)
+                    if blog_entry:
+                        yield blog_entry
+
+            # Then fetch posts from GraphQL API
+            logger.info("Fetching posts from GraphQL API")
+            yield from self._fetch_graphql_posts()
+
+        except Exception as e:
+            logger.error(f"Failed to scrape Meta Engineering blog: {str(e)}")
             raise
 
         finally:
