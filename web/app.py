@@ -3,11 +3,16 @@ from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 import numpy as np
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, util
 import pandas as pd
 from pathlib import Path
 import os
 import glob
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -41,20 +46,42 @@ async def home(request: Request):
 async def search(job_description: str = Form(...)):
     # Generate embedding for the job description
     query_embedding = model.encode(job_description)
+    logger.info(f"Query embedding shape: {query_embedding.shape}")
 
     # Load the parquet file
     df = load_embeddings()
     if df is None:
         return {"error": "No blog posts found. Please run the scraper first."}
 
-    # Calculate cosine similarity
-    similarities = np.dot(df["embedding"].tolist(), query_embedding) / (
-        np.linalg.norm(df["embedding"].tolist(), axis=1)
-        * np.linalg.norm(query_embedding)
-    )
+    logger.info(f"Number of embeddings in corpus: {len(df)}")
 
-    # Get top 5 matches
-    top_indices = np.argsort(similarities)[-5:][::-1]
+    # Convert embeddings to tensor - they're already numpy arrays
+    corpus_embeddings = np.stack(df["embedding"].values)
+    logger.info(f"Corpus embeddings shape: {corpus_embeddings.shape}")
+
+    query_embedding = query_embedding.reshape(1, -1)
+    logger.info(f"Reshaped query embedding shape: {query_embedding.shape}")
+
+    # Calculate cosine similarity
+    similarities = util.cos_sim(query_embedding, corpus_embeddings)[0]
+    logger.info(f"Similarities shape: {similarities.shape}")
+    logger.info(f"Similarities type: {type(similarities)}")
+    logger.info(f"Similarities content: {similarities}")
+
+    # Convert PyTorch tensor to NumPy array
+    similarities_np = similarities.cpu().numpy()
+    logger.info(f"Converted similarities type: {type(similarities_np)}")
+
+    # Get top 5 matches (or fewer if there are less than 5 items)
+    n_results = min(5, len(similarities_np))
+    logger.info(f"Number of results to return: {n_results}")
+
+    if len(similarities_np) == 0:
+        return {"error": "No similarities calculated. Please check your embeddings."}
+
+    top_indices = np.argsort(similarities_np)[-n_results:][::-1]
+    logger.info(f"Top indices: {top_indices}")
+
     results = df.iloc[top_indices][["title", "url", "source", "content"]].to_dict(
         "records"
     )
